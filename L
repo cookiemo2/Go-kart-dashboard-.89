@@ -1,0 +1,5 @@
+# Check I2C devices are actually detected
+i2cdetect -y 1
+
+# Check GPIO is free
+gpio readall
