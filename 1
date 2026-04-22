@@ -1,0 +1,15 @@
+#!/bin/bash
+# Kart Dashboard v2.0 — Installer
+set -e
+echo "Installing Kart Dashboard dependencies..."
+sudo apt-get update -q
+sudo apt-get install -y \
+    python3-pip python3-pygame \
+    python3-smbus i2c-tools \
+    python3-rpi.gpio \
+    libopencv-dev python3-opencv \
+    fonts-dejavu
+pip3 install smbus2 --break-system-packages 2>/dev/null || pip3 install smbus2
+sudo raspi-config nonint do_i2c 0
+echo "Done! Run: python3 dashboard.py"
+echo "Verify I2C: i2cdetect -y 1  (expect 0x40=INA219, 0x68=MPU)"
