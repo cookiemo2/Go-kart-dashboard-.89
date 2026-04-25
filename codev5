@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""
+Kart Dashboard  —  Tesla Style  —  Raspberry Pi 4  |  800x480
+Sensors: INA219 (I2C), Hall Effect, HC-SR04 x2, Buzzer, USB Camera
+"""
+
+import pygame
+import sys
+import math
+import time
+import threading
+import os
+
+# ── Hardware detection ────────────────────────────────────────────────────────
+DEMO_MODE = False
+try:
+    import smbus2
+    import RPi.GPIO as GPIO
+    import cv2
+    os.environ["GST_DEBUG"] = "0"
+    HW_AVAILABLE = True
+except ImportError:
+    HW_AVAILABLE = False
+    DEMO_MODE = True
+    print("[INFO] Running in DEMO mode — hardware libs not found")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+I2C_BUS        = 1
+
+# INA219 — calibration
+# INA219_CAL_VAL and INA219_CUR_LSB depend on your shunt resistor.
+# Most cheap breakout boards use a 0.1-ohm shunt:
+#   For +-3.2A range:  CAL=4096,  CUR_LSB=0.0001  (100 uA/bit)
+#   For +-6.4A range:  CAL=2048,  CUR_LSB=0.0002  (200 uA/bit)
+#   For +-32A range:   CAL=409,   CUR_LSB=0.001   (1 mA/bit)  <- use for kart motors
+# If your amps reading looks wrong, adjust CUR_LSB until it matches a clamp meter.
+INA219_ADDR    = 0x40
+INA219_REG_CFG = 0x00
+INA219_REG_BUS = 0x02
+INA219_REG_CUR = 0x04
+INA219_REG_CAL = 0x05
+INA219_CAL_VAL = 4096          # +-3.2A range, 0.1-ohm shunt
+INA219_CUR_LSB = 0.0001        # 100 uA per bit
+
+# Battery pack — 6S LiPo
+BATT_FULL_V    = 25.2        # 6S LiPo full  (4.20V x 6)
+BATT_EMPTY_V   = 19.8        # 6S LiPo empty (3.30V x 6)
+
+# GPIO (BCM)
+HALL_PIN       = 17
+MAGNET_COUNT   = 4
+TRIG_FRONT     = 23
+ECHO_FRONT     = 24
+TRIG_BACK      = 27
+ECHO_BACK      = 22
+BUZZER_PIN     = 18
+
+WHEEL_CIRC_M   = 0.628       # pi * wheel_diameter_m  (adjust!)
+CAMERA_INDEX   = 0
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SHARED STATE
+# ══════════════════════════════════════════════════════════════════════════════
+state = {
+    "speed_kph":    0.0,
+    "dist_front":   999,
+    "dist_back":    999,
+    "batt_pct":     100,
+    "batt_v":       12.6,
+    "batt_amps":    0.0,
+    "batt_mw":      0.0,
+    "camera_frame": None,
+}
+state_lock = threading.Lock()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INA219 DRIVER
+# ══════════════════════════════════════════════════════════════════════════════
+class INA219:
+    def __init__(self, bus, addr=INA219_ADDR):
+        self.bus  = bus
+        self.addr = addr
+        self._write(INA219_REG_CAL, INA219_CAL_VAL)
+        self._write(INA219_REG_CFG, 0x1FFF)  # 32V, 320mV shunt, 12-bit, continuous
+
+    def _write(self, reg, val):
+        self.bus.write_i2c_block_data(self.addr, reg,
+                                      [(val >> 8) & 0xFF, val & 0xFF])
+
+    def _read(self, reg):
+        d = self.bus.read_i2c_block_data(self.addr, reg, 2)
+        return (d[0] << 8) | d[1]
+
+    def voltage(self):
+        return (self._read(INA219_REG_BUS) >> 3) * 0.004
+
+    def current_A(self):
+        raw = self._read(INA219_REG_CUR)
+        if raw > 32767: raw -= 65536
+        return raw * INA219_CUR_LSB
+
+    def power_mW(self):
+        return self._read(0x03) * 2.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GPIO SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+def setup_gpio():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(HALL_PIN,   GPIO.IN,  pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(TRIG_FRONT, GPIO.OUT); GPIO.output(TRIG_FRONT, False)
+    GPIO.setup(ECHO_FRONT, GPIO.IN)
+    GPIO.setup(TRIG_BACK,  GPIO.OUT); GPIO.output(TRIG_BACK,  False)
+    GPIO.setup(ECHO_BACK,  GPIO.IN)
+    GPIO.setup(BUZZER_PIN, GPIO.OUT)
+
+def _ultrasonic_single(trig, echo):
+    """One raw reading. Returns cm or 999 on timeout."""
+    try:
+        # Ensure trig is low before pulse
+        GPIO.output(trig, False)
+        time.sleep(0.002)
+        GPIO.output(trig, True)
+        time.sleep(1e-5)
+        GPIO.output(trig, False)
+        t0 = time.time()
+        while GPIO.input(echo) == 0:
+            if time.time() - t0 > 0.06: return 999   # wait for echo start
+        t1 = time.time()
+        while GPIO.input(echo) == 1:
+            if time.time() - t1 > 0.06: return 999   # wait for echo end
+        dist = (time.time() - t1) * 17150
+        # Reject physically impossible readings
+        if dist < 2 or dist > 400:
+            return 999
+        return round(dist, 1)
+    except Exception:
+        return 999
+
+def _ultrasonic(trig, echo, samples=3):
+    """Median of N readings to filter out spikes."""
+    readings = []
+    for _ in range(samples):
+        r = _ultrasonic_single(trig, echo)
+        readings.append(r)
+        time.sleep(0.015)   # let echo fully clear before next ping
+    valid = [r for r in readings if r < 999]
+    if not valid:
+        return 999
+    valid.sort()
+    return valid[len(valid)//2]   # median
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SENSOR THREADS
+# ══════════════════════════════════════════════════════════════════════════════
+def thread_speed():
+    pulses = []
+    def cb(ch):
+        pulses.append(time.time())
+        if len(pulses) > MAGNET_COUNT * 4:
+            pulses.pop(0)
+        # Uncomment to debug in terminal — comment out once working:
+        print(f"[Hall] pulse detected  total_recent={len([t for t in pulses if time.time()-t<2])}")
+
+    try:
+        GPIO.remove_event_detect(HALL_PIN)
+    except Exception:
+        pass
+    try:
+        # bouncetime=2ms — lower so fast pulses aren't missed
+        GPIO.add_event_detect(HALL_PIN, GPIO.FALLING, callback=cb, bouncetime=2)
+        print("[Hall] OK on GPIO", HALL_PIN)
+    except RuntimeError as e:
+        print(f"[Hall] WARNING: {e}  — speed will read 0")
+
+    last_nonzero = 0.0
+    while True:
+        time.sleep(0.15)
+        try:
+            now = time.time()
+            # Use 1.5s window so speed doesn't drop to 0 between magnet passes at low speed
+            recent = [t for t in pulses if now - t < 1.5]
+            if len(recent) >= 2:
+                ivs = [recent[i+1]-recent[i] for i in range(len(recent)-1)]
+                avg_iv = sum(ivs)/len(ivs)
+                if avg_iv > 0:
+                    rps = 1.0 / (avg_iv * MAGNET_COUNT)
+                    kph = rps * WHEEL_CIRC_M * 3.6
+                    last_nonzero = now
+                else:
+                    kph = 0.0
+            else:
+                kph = 0.0
+            # Only zero out speed if no pulses for 1.5s (prevents flicker at low speed)
+            if kph == 0.0 and (now - last_nonzero) < 1.5:
+                pass   # keep last known speed briefly
+            else:
+                with state_lock:
+                    state["speed_kph"] = min(kph, 150.0)
+        except Exception as e:
+            print(f"[Hall] calc error: {e}")
+
+def thread_ultrasonic():
+    while True:
+        df = _ultrasonic(TRIG_FRONT, ECHO_FRONT)
+        time.sleep(0.05)        # let ultrasound dissipate before firing second sensor
+        db = _ultrasonic(TRIG_BACK,  ECHO_BACK)
+        with state_lock:
+            state["dist_front"] = df
+            state["dist_back"]  = db
+        time.sleep(0.05)
+
+def thread_buzzer():
+    """PWM tone buzzer for passive buzzers — beeps faster the closer the object."""
+    pwm = GPIO.PWM(BUZZER_PIN, 2000)   # 2kHz tone — good beep pitch
+    pwm.start(0)                        # start silent
+
+    while True:
+        try:
+            with state_lock:
+                d = min(state["dist_front"], state["dist_back"])
+
+            if d < 200:
+                # Beep period: 800ms at 200cm → 80ms at 10cm
+                period = max(0.08, d / 250.0)
+                beep_on  = period * 0.4
+                beep_off = period * 0.6
+
+                pwm.ChangeDutyCycle(50)   # 50% duty = loudest tone
+                time.sleep(beep_on)
+                pwm.ChangeDutyCycle(0)    # silent
+                time.sleep(beep_off)
+            else:
+                pwm.ChangeDutyCycle(0)
+                time.sleep(0.1)
+
+        except Exception:
+            pwm.ChangeDutyCycle(0)
+            time.sleep(0.1)
+
+def thread_camera():
+    cap = None
+    for backend in [cv2.CAP_V4L2, cv2.CAP_ANY]:
+        try:
+            c = cv2.VideoCapture(CAMERA_INDEX, backend)
+            if c.isOpened():
+                cap = c
+                print(f"[CAM] Opened (backend {backend})")
+                break
+            c.release()
+        except Exception:
+            pass
+    if cap is None:
+        print("[CAM] No camera found.")
+        return
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+    while True:
+        try:
+            ret, frame = cap.read()
+            if ret:
+                rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+                with state_lock:
+                    state["camera_frame"] = surf
+            else:
+                time.sleep(0.1)
+        except Exception as e:
+            print(f"[CAM] error: {e}")
+            time.sleep(0.5)
+        time.sleep(0.033)
+
+def thread_power():
+    bus = None; ina = None
+    for attempt in range(10):
+        try:
+            bus = smbus2.SMBus(I2C_BUS)
+            ina = INA219(bus)
+            print(f"[INA219] OK at 0x{INA219_ADDR:02X}")
+            break
+        except Exception as e:
+            print(f"[INA219] Init attempt {attempt+1} failed: {e}. Retrying in 2s...")
+            time.sleep(2)
+    if ina is None:
+        print("[INA219] Not found. Battery disabled.")
+        return
+    while True:
+        try:
+            v   = ina.voltage()
+            a   = ina.current_A()
+            mw  = ina.power_mW()
+            pct = int(((v - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V)) * 100)
+            pct = max(0, min(100, pct))
+            with state_lock:
+                state["batt_v"]    = v
+                state["batt_amps"] = a
+                state["batt_mw"]   = mw
+                state["batt_pct"]  = pct
+        except Exception as e:
+            print(f"[INA219] Read error: {e}. Re-init...")
+            time.sleep(1)
+            try:
+                bus = smbus2.SMBus(I2C_BUS)
+                ina = INA219(bus)
+            except Exception:
+                pass
+        time.sleep(0.4)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DEMO SIMULATION
+# ══════════════════════════════════════════════════════════════════════════════
+_dt = 0.0
+def demo_tick():
+    global _dt; _dt += 0.025
+    with state_lock:
+        state["speed_kph"]  = 55 + 40*math.sin(_dt*0.28)
+        state["dist_front"] = max(8,  160 + 130*math.sin(_dt*0.62))
+        state["dist_back"]  = max(8,  190 + 100*math.sin(_dt*0.51+2))
+        state["batt_pct"]   = int(68 + 18*math.sin(_dt*0.08))
+        state["batt_v"]     = 11.2 + 1.2*math.sin(_dt*0.08)
+        state["batt_amps"]  = abs(6.5*math.sin(_dt*0.19))
+        state["batt_mw"]    = state["batt_v"] * state["batt_amps"] * 1000
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PALETTE  — Tesla: near-black, white, red accent only
+# ══════════════════════════════════════════════════════════════════════════════
+W, H = 800, 480
+
+C_BG   = (  7,   7,   7)
+C_CARD = ( 16,  16,  16)
+C_LINE = ( 36,  36,  36)
+C_WHT  = (240, 240, 240)
+C_G1   = (155, 155, 155)
+C_G2   = ( 88,  88,  88)
+C_RED  = (225,  55,  42)
+C_ORG  = (230, 140,  20)
+C_GRN  = ( 90, 205,  90)
+C_BLU  = ( 75, 155, 255)
+
+def lerp_c(a, b, t):
+    return tuple(int(a[i]+(b[i]-a[i])*t) for i in range(3))
+
+def dist_col(d):
+    if d <  30: return C_RED
+    if d <  80: return C_ORG
+    if d < 160: return (200, 200, 55)
+    return C_GRN
+
+def batt_col(p):
+    if p < 20: return C_RED
+    if p < 40: return C_ORG
+    return C_GRN
+
+def txt(surf, text, font, color, x, y, anchor="center"):
+    img = font.render(str(text), True, color)
+    r   = img.get_rect()
+    setattr(r, anchor, (x, y))
+    surf.blit(img, r)
+
+def vline(s, x, y1, y2): pygame.draw.line(s, C_LINE, (x,y1), (x,y2), 1)
+def hline(s, y, x1, x2): pygame.draw.line(s, C_LINE, (x1,y), (x2,y), 1)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STARTUP ANIMATION  — "C" arc sweeps in then fades to dashboard
+# ══════════════════════════════════════════════════════════════════════════════
+def run_startup(screen, f_sub):
+    clock  = pygame.time.Clock()
+    t0     = time.time()
+    CX, CY, R = W//2, H//2, 96
+    START_A = math.radians(30)
+    END_A   = math.radians(330)
+
+    def draw_C(surf, progress, brightness=1.0):
+        total   = END_A - START_A
+        draw_to = START_A + total * progress
+        rect    = pygame.Rect(CX-R, CY-R, R*2, R*2)
+        for thick, am in [(26,0.04),(18,0.10),(10,0.28),(5,0.60),(2,1.00)]:
+            col = lerp_c(C_G2, C_WHT, am * brightness)
+            a1, a2 = -draw_to, -START_A
+            if abs(a2-a1) > 0.01:
+                pygame.draw.arc(surf, col, rect, a1, a2, thick)
+        # leading dot
+        if progress > 0.01:
+            dx = CX + R*math.cos(-draw_to)
+            dy = CY + R*math.sin(-draw_to)
+            for rr, aa in [(22,20),(14,50),(8,110),(4,200)]:
+                gs = pygame.Surface((rr*2,rr*2), pygame.SRCALPHA)
+                pygame.draw.circle(gs, (*C_WHT, aa), (rr,rr), rr)
+                surf.blit(gs, (int(dx-rr), int(dy-rr)))
+
+    while True:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT: pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE: return
+
+        t = time.time() - t0
+        if t > 3.5: return
+
+        screen.fill(C_BG)
+
+        if t < 1.3:
+            p = t / 1.3
+            draw_C(screen, p*p*(3-2*p))             # smoothstep
+
+        elif t < 2.3:
+            sub_t = (t-1.3)/1.0
+            draw_C(screen, 1.0, 0.88+0.12*math.sin(t*9))
+            if sub_t > 0.25:
+                fa = min(255, int((sub_t-0.25)/0.5*255))
+                si = pygame.font.SysFont("dejavusans",18).render("KART DASHBOARD",True,C_G1)
+                si.set_alpha(fa)
+                screen.blit(si, si.get_rect(center=(CX, CY+R+34)))
+            if sub_t > 0.55:
+                fa2 = min(255, int((sub_t-0.55)/0.35*255))
+                vi  = pygame.font.SysFont("dejavusans",13).render("v2.1  |  INA219",True,C_G2)
+                vi.set_alpha(fa2)
+                screen.blit(vi, vi.get_rect(center=(CX, CY+R+58)))
+        else:
+            fade_t = (t-2.3)/1.2
+            draw_C(screen, 1.0, 1.0-fade_t)
+            fade = pygame.Surface((W,H)); fade.fill(C_BG)
+            fade.set_alpha(int(fade_t*255))
+            screen.blit(fade,(0,0))
+
+        pygame.display.flip()
+        clock.tick(60)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UI WIDGETS
+# ══════════════════════════════════════════════════════════════════════════════
+def draw_speed_arc(surf, cx, cy, R, speed, f_num, f_unit):
+    MAX  = 130
+    span = math.radians(280)
+    fill = span * min(speed, MAX) / MAX
+    # Track
+    pygame.draw.arc(surf, C_LINE,
+        pygame.Rect(cx-R, cy-R, R*2, R*2),
+        math.radians(220), math.radians(500), 7)
+    # Coloured fill
+    if fill > 0.01:
+        col = lerp_c(C_GRN, C_RED, min(speed,MAX)/MAX)
+        pygame.draw.arc(surf, col,
+            pygame.Rect(cx-R+2, cy-R+2, (R-2)*2, (R-2)*2),
+            math.radians(220), math.radians(220)+fill, 7)
+    # Ticks
+    for s in range(0, MAX+1, 20):
+        a  = math.radians(220 + 280*s/MAX)
+        ix = int(cx+(R-18)*math.cos(a)); iy = int(cy-(R-18)*math.sin(a))
+        ox = int(cx+(R+4) *math.cos(a)); oy = int(cy-(R+4) *math.sin(a))
+        pygame.draw.line(surf, C_G2, (ix,iy),(ox,oy), 1)
+    txt(surf, f"{int(speed)}", f_num,  C_WHT, cx, cy+14)
+    txt(surf, "km/h",          f_unit, C_G2,  cx, cy+54)
+
+def draw_battery(surf, x, y, w, h, pct, volts, amps, mw, fb, fs):
+    col = batt_col(pct)
+    pygame.draw.rect(surf, C_LINE, (x,y,w,h), 1, border_radius=4)
+    pygame.draw.rect(surf, C_LINE, (x+w, y+h//3, 5, h//3), border_radius=2)
+    fw = max(0, int((w-4)*pct/100))
+    if fw > 0:
+        pygame.draw.rect(surf, col, (x+2,y+2,fw,h-4), border_radius=3)
+    txt(surf, f"{pct}%",         fb, C_WHT, x+w//2,  y+h//2)
+    txt(surf, f"{volts:.2f} V",  fs, C_G2,  x,        y+h+14, "midleft")
+    txt(surf, f"{amps:.2f} A",   fs, C_G2,  x+w//2,   y+h+14, "center")
+    txt(surf, f"{mw/1000:.1f} W",fs, C_G2,  x+w,      y+h+14, "midright")
+
+def draw_radar(surf, cx, cy, r, dist_front, dist_back, f_val):
+    """
+    Mini top-down radar: kart in centre, front/back arcs show obstacle proximity.
+    Closer = brighter + animated pulse ring.
+    """
+    MAX = 250
+
+    # Background circle
+    pygame.draw.circle(surf, C_CARD, (cx, cy), r)
+    pygame.draw.circle(surf, C_LINE, (cx, cy), r, 1)
+
+    # Range rings
+    for ring_r in [r//3, (r*2)//3]:
+        pygame.draw.circle(surf, C_LINE, (cx, cy), ring_r, 1)
+
+    # Centre axis lines
+    pygame.draw.line(surf, C_LINE, (cx, cy-r), (cx, cy+r), 1)
+    pygame.draw.line(surf, C_LINE, (cx-r, cy), (cx+r, cy), 1)
+
+    def draw_obstacle_arc(dist, direction):
+        """direction: -1 = front (top), +1 = back (bottom)"""
+        if dist >= MAX: return
+        frac  = 1.0 - dist / MAX
+        col   = dist_col(dist)
+        # How far the obstacle marker sits from centre
+        obj_y = cy + direction * int(r * dist / MAX)
+        obj_x = cx
+
+        # Danger arc (semi-circle on the relevant side)
+        arc_r = max(4, int(frac * r * 0.7))
+        arc_rect = pygame.Rect(obj_x-arc_r, obj_y-arc_r, arc_r*2, arc_r*2)
+        if direction == -1:    # front — draw bottom semi
+            pygame.draw.arc(surf, col, arc_rect,
+                            math.pi, math.pi*2, max(1, int(frac*3)+1))
+        else:                  # back  — draw top semi
+            pygame.draw.arc(surf, col, arc_rect,
+                            0, math.pi, max(1, int(frac*3)+1))
+
+        # Dot at obstacle position
+        pygame.draw.circle(surf, col, (obj_x, obj_y), max(3, int(frac*6)))
+
+        # Pulse ring when very close
+        if dist < 50:
+            pulse_r = int(arc_r + 6*abs(math.sin(time.time()*8)))
+            ps = pygame.Surface((pulse_r*2+2, pulse_r*2+2), pygame.SRCALPHA)
+            pygame.draw.circle(ps, (*col, 80), (pulse_r+1,pulse_r+1), pulse_r, 2)
+            surf.blit(ps, (obj_x-pulse_r-1, obj_y-pulse_r-1))
+
+        # Distance label
+        txt(surf, f"{int(dist)}cm", f_val, col, obj_x, obj_y + direction*14)
+
+    draw_obstacle_arc(dist_front, -1)
+    draw_obstacle_arc(dist_back,   1)
+
+    # Kart rectangle in centre
+    kw, kh = 12, 22
+    pygame.draw.rect(surf, C_G1, (cx-kw//2, cy-kh//2, kw, kh), border_radius=3)
+    # Front indicator (small triangle)
+    pygame.draw.polygon(surf, C_WHT, [
+        (cx, cy-kh//2-6), (cx-5, cy-kh//2+1), (cx+5, cy-kh//2+1)
+    ])
+
+    # Labels
+    txt(surf, "F", f_val, C_G2, cx+r-10, cy-r+10)
+    txt(surf, "R", f_val, C_G2, cx+r-10, cy+r-10)
+
+def draw_power_bar(surf, x, y, w, mw, fl, fv):
+    MAX_W = 100.0
+    frac  = min(mw/1000/MAX_W, 1.0)
+    pygame.draw.rect(surf, C_LINE, (x,y,w,7), border_radius=3)
+    if frac > 0:
+        pygame.draw.rect(surf, C_BLU, (x,y,int(w*frac),7), border_radius=3)
+    txt(surf, "POWER",          fl, C_G2,  x,   y+18, "midleft")
+    txt(surf, f"{mw/1000:.1f} W", fv, C_WHT, x+w, y+18, "midright")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+def main():
+    pygame.init()
+    flags  = pygame.NOFRAME if not DEMO_MODE else 0
+    screen = pygame.display.set_mode((W, H), flags)
+    pygame.display.set_caption("Kart Dashboard")
+    pygame.mouse.set_visible(False)
+
+    f_sub  = pygame.font.SysFont("dejavusans", 18)
+    f_spd  = pygame.font.SysFont("dejavusans", 54, bold=True)
+    f_unit = pygame.font.SysFont("dejavusans", 14)
+    f_head = pygame.font.SysFont("dejavusans", 14, bold=True)
+    f_lbl  = pygame.font.SysFont("dejavusans", 12)
+    f_val  = pygame.font.SysFont("dejavusans", 11, bold=True)
+    f_batt = pygame.font.SysFont("dejavusans", 16, bold=True)
+    f_sm   = pygame.font.SysFont("dejavusans", 11)
+
+    # Startup animation
+    run_startup(screen, f_sub)
+
+    # Hardware threads
+    if HW_AVAILABLE:
+        setup_gpio()
+        for fn in [thread_speed, thread_ultrasonic, thread_buzzer,
+                   thread_camera, thread_power]:
+            threading.Thread(target=fn, daemon=True).start()
+
+    clock = pygame.time.Clock()
+
+    # Layout: Left | Centre | Right
+    # Left:   0–219   — Speedometer
+    # Centre: 220–549 — Camera (big)
+    # Right:  550–799 — Radar + Battery
+    COL_C = 220
+    COL_R = 550
+
+    while True:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                break
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                if HW_AVAILABLE: GPIO.cleanup()
+                pygame.quit(); sys.exit()
+
+        if DEMO_MODE: demo_tick()
+
+        with state_lock:
+            speed = state["speed_kph"]
+            df    = state["dist_front"]
+            db    = state["dist_back"]
+            bp    = state["batt_pct"]
+            bv    = state["batt_v"]
+            ba    = state["batt_amps"]
+            bmw   = state["batt_mw"]
+            cam   = state["camera_frame"]
+
+        # ── Background ────────────────────────────────────────────────────
+        screen.fill(C_BG)
+
+        # ── Column dividers ───────────────────────────────────────────────
+        vline(screen, COL_C, 18, H-28)
+        vline(screen, COL_R, 18, H-28)
+        hline(screen, H-28,  0,  W)
+
+        # ══════════════════════════════════════════════════════════════════
+        #  LEFT — Speedometer
+        # ══════════════════════════════════════════════════════════════════
+        spd_cx = COL_C // 2
+        txt(screen, "SPEED", f_head, C_G2, spd_cx, 28)
+        draw_speed_arc(screen, spd_cx, 195, 94, speed, f_spd, f_unit)
+
+        # Front / rear distance bars under speedo
+        hline(screen, 332, 8, COL_C-8)
+        bar_w = COL_C - 24
+
+        # Front bar
+        df_frac = max(0, min(df, 250)) / 250
+        df_col  = dist_col(df)
+        txt(screen, "FRONT", f_lbl, C_G2, 12, 345, "midleft")
+        ds_f = f"{int(df)} cm" if df < 999 else "---"
+        txt(screen, ds_f, f_val, df_col, COL_C-12, 345, "midright")
+        pygame.draw.rect(screen, C_LINE, (12, 356, bar_w, 5), border_radius=3)
+        if df_frac > 0:
+            pygame.draw.rect(screen, df_col, (12, 356, int(bar_w*df_frac), 5), border_radius=3)
+
+        # Rear bar
+        db_frac = max(0, min(db, 250)) / 250
+        db_col  = dist_col(db)
+        txt(screen, "REAR", f_lbl, C_G2, 12, 375, "midleft")
+        ds_b = f"{int(db)} cm" if db < 999 else "---"
+        txt(screen, ds_b, f_val, db_col, COL_C-12, 375, "midright")
+        pygame.draw.rect(screen, C_LINE, (12, 386, bar_w, 5), border_radius=3)
+        if db_frac > 0:
+            pygame.draw.rect(screen, db_col, (12, 386, int(bar_w*db_frac), 5), border_radius=3)
+
+        # ══════════════════════════════════════════════════════════════════
+        #  CENTRE — Camera feed (large)
+        # ══════════════════════════════════════════════════════════════════
+        cam_x = COL_C + 4
+        cam_y = 8
+        cam_w = COL_R - COL_C - 8
+        cam_h = H - 28 - cam_y - 4
+
+        pygame.draw.rect(screen, C_CARD, (cam_x, cam_y, cam_w, cam_h))
+        if cam:
+            scaled = pygame.transform.scale(cam, (cam_w, cam_h))
+            screen.blit(scaled, (cam_x, cam_y))
+            txt(screen, "CAM", f_lbl, C_G1, cam_x+6, cam_y+10, "midleft")
+        else:
+            txt(screen, "NO SIGNAL", f_lbl, C_G2,
+                cam_x+cam_w//2, cam_y+cam_h//2)
+
+        # ══════════════════════════════════════════════════════════════════
+        #  RIGHT — Radar + Battery + Power
+        # ══════════════════════════════════════════════════════════════════
+        right_cx = (COL_R + W) // 2
+        right_w  = W - COL_R
+
+        # Radar
+        txt(screen, "RADAR", f_head, C_G2, right_cx, 24)
+        radar_r  = 88
+        radar_cy = 38 + radar_r + 4
+        draw_radar(screen, right_cx, radar_cy, radar_r, df, db, f_val)
+
+        # Battery
+        batt_top = radar_cy + radar_r + 20
+        hline(screen, batt_top, COL_R+4, W-4)
+        txt(screen, "BATTERY", f_head, C_G2, right_cx, batt_top+12)
+        batt_x = COL_R + 14
+        batt_w = right_w - 28
+        draw_battery(screen, batt_x, batt_top+24, batt_w, 36,
+                     bp, bv, ba, bmw, f_batt, f_sm)
+
+        # Power bar
+        pw_top = batt_top + 80
+        hline(screen, pw_top, COL_R+4, W-4)
+        draw_power_bar(screen, batt_x, pw_top+10, batt_w, bmw, f_lbl, f_val)
+
+        # ── Collision overlay ─────────────────────────────────────────────
+        front_warn = df < 30
+        back_warn  = db < 30
+        if front_warn or back_warn:
+            alpha = int(50 + 50*abs(math.sin(time.time()*9)))
+            ov = pygame.Surface((W,H), pygame.SRCALPHA)
+            ov.fill((*C_RED, alpha))
+            screen.blit(ov, (0,0))
+            if front_warn and back_warn:
+                warn_txt = "⚠  FRONT & REAR COLLISION WARNING"
+            elif front_warn:
+                warn_txt = "⚠  FRONT COLLISION WARNING"
+            else:
+                warn_txt = "⚠  REAR COLLISION WARNING"
+            txt(screen, warn_txt, f_head, C_WHT, W//2, H//2 - 10)
+            # Show both distances in the overlay
+            txt(screen, f"FRONT: {int(df)} cm    REAR: {int(db)} cm",
+                f_sm, C_WHT, W//2, H//2 + 12)
+
+        # ── Status bar ────────────────────────────────────────────────────
+        mode_txt = "LIVE" if HW_AVAILABLE else "DEMO"
+        mode_col = C_GRN  if HW_AVAILABLE else C_ORG
+        pygame.draw.circle(screen, mode_col, (10, H-14), 4)
+        txt(screen, mode_txt,                    f_sm, mode_col, 22,  H-14, "midleft")
+        txt(screen, "KART  DASHBOARD",           f_sm, C_G2,    W//2,H-14)
+        txt(screen, time.strftime("%H:%M:%S"),   f_sm, C_G2,    W-8, H-14, "midright")
+
+        pygame.display.flip()
+        clock.tick(30)
+
+    if HW_AVAILABLE:
+        GPIO.cleanup()
+    pygame.quit()
+    sys.exit()
+
+if __name__ == "__main__":
+    main()
